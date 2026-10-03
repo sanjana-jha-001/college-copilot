@@ -51,7 +51,7 @@ with st.sidebar:
     pasted = st.text_area("Or paste any notice text")
     days = st.slider("Look back (days)", 7, 120, 45)
     fast = st.checkbox("Fast mode (only scan messages with keywords)", True)
-    go = st.button("🔍 Analyze", type="primary", use_container_width=True)
+    go = st.button("🔍 Analyze", type="primary", width="stretch")
 
 # attendance table lives in main area (Attendance tab) but subjects needed for extraction
 att_df = pd.DataFrame(P["attendance"])
