@@ -119,7 +119,7 @@ with tab_today:
 with tab_att:
     st.header("Attendance planner")
     st.caption("Edit the table with your latest numbers. Math is done in code, not by the AI.")
-    edited = st.data_editor(att_df, num_rows="dynamic", use_container_width=True)
+    edited = st.data_editor(att_df, num_rows="dynamic", width="stretch")
     P["attendance"] = edited.dropna().to_dict("records")
     rows = []
     for r in P["attendance"]:
