@@ -20,15 +20,21 @@ if "profile" not in st.session_state:
     st.session_state.items, st.session_state.brief = [], ""
 P = st.session_state.profile
 
+# Retrieve Groq API Key from Streamlit Secrets or Environment Variable
+GROQ_API_KEY = st.secrets.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY")
+
 # ---------------- Sidebar ----------------
 with st.sidebar:
     st.title("🎓 College Copilot")
-    st.caption("100% local · your chats never leave this laptop")
-    models = core.list_models()
-    if not models:
-        st.error("Ollama not running. Start it and run: ollama pull qwen2.5:7b")
-    model = st.selectbox("Model", models or ["qwen2.5:7b"])
-    vision = st.text_input("Vision model (for screenshots)", "qwen2.5vl:7b")
+    st.caption("Powered by Groq Cloud API ⚡")
+    
+    if not GROQ_API_KEY:
+        st.error("⚠️ GROQ_API_KEY missing! Add it in Streamlit Cloud -> Settings -> Secrets.")
+    
+    # Available Groq models
+    groq_models = ["qwen-2.5-32b", "llama-3.1-8b-instant", "llama-3.3-70b-versatile"]
+    model = st.selectbox("Model", groq_models, index=0)
+    vision = st.text_input("Vision model (for screenshots)", "llama-3.2-11b-vision-preview")
 
     st.subheader("Student profile")
     P["name"] = st.text_input("Name", P["name"])
@@ -52,27 +58,30 @@ att_df = pd.DataFrame(P["attendance"])
 P["subjects"] = list(att_df["subject"])
 
 if go:
-    blocks = []
-    for f in chats:
-        msgs = core.relevant_messages(core.parse_chat(f.getvalue().decode("utf-8", "ignore")), days, fast)
-        blocks += core.chunk_messages(msgs)
-    for f in pdfs:
-        t = core.pdf_to_text(f)
-        blocks += [t[i:i + 3500] for i in range(0, len(t), 3500)]
-    for f in imgs:
-        blocks.append(core.image_to_text(f.getvalue(), vision))
-    if pasted.strip():
-        blocks.append(pasted)
-    if not blocks:
-        st.warning("Upload at least one chat, PDF, screenshot or pasted text.")
+    if not GROQ_API_KEY:
+        st.error("Please add your GROQ_API_KEY before running analysis.")
     else:
-        bar = st.progress(0, text="Local AI is reading everything…")
-        raw = core.extract_items(blocks, P, model, progress=lambda x: bar.progress(x))
-        bar.empty()
-        st.session_state["items"] = core.rank(raw, P)
-        alerts = core.attendance_actions(P["attendance"], P["req"])
-        st.session_state.brief = core.morning_brief(st.session_state.items, alerts, P, model) if raw or alerts else ""
-        json.dump(P, open(PROFILE_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+        blocks = []
+        for f in chats:
+            msgs = core.relevant_messages(core.parse_chat(f.getvalue().decode("utf-8", "ignore")), days, fast)
+            blocks += core.chunk_messages(msgs)
+        for f in pdfs:
+            t = core.pdf_to_text(f)
+            blocks += [t[i:i + 3500] for i in range(0, len(t), 3500)]
+        for f in imgs:
+            blocks.append(core.image_to_text(f.getvalue(), vision, api_key=GROQ_API_KEY))
+        if pasted.strip():
+            blocks.append(pasted)
+        if not blocks:
+            st.warning("Upload at least one chat, PDF, screenshot or pasted text.")
+        else:
+            bar = st.progress(0, text="Groq AI is analyzing your files…")
+            raw = core.extract_items(blocks, P, model, progress=lambda x: bar.progress(x), api_key=GROQ_API_KEY)
+            bar.empty()
+            st.session_state["items"] = core.rank(raw, P)
+            alerts = core.attendance_actions(P["attendance"], P["req"])
+            st.session_state.brief = core.morning_brief(st.session_state.items, alerts, P, model, api_key=GROQ_API_KEY) if raw or alerts else ""
+            json.dump(P, open(PROFILE_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
 
 items = st.session_state["items"]
 alerts = core.attendance_actions(P["attendance"], P["req"])
@@ -144,8 +153,11 @@ with tab_ask:
     st.header("Ask your copilot")
     q = st.text_input("e.g. 'Is hafte kya submit karna hai?' / 'Kaunsa internship apply karun?'")
     if q:
-        with st.spinner("Thinking locally…"):
-            st.write(core.ask(q, items, alerts, P, model))
+        if not GROQ_API_KEY:
+            st.error("Please add your GROQ_API_KEY to secrets to use chat.")
+        else:
+            with st.spinner("Thinking on Groq Cloud…"):
+                st.write(core.ask(q, items, alerts, P, model, api_key=GROQ_API_KEY))
 
 with tab_exp:
     st.header("Export")
