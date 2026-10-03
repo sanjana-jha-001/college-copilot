@@ -128,7 +128,7 @@ with tab_att:
                      "Status": {"danger": "🔴 Low", "edge": "🟡 Edge", "safe": "🟢 Safe"}[s["state"]],
                      "Must attend next": s["need"], "Safe bunks left": s["skip"]})
     if rows:
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
         st.bar_chart(pd.DataFrame(rows).set_index("Subject")["Attendance %"])
         st.subheader("🎯 Bunk simulator")
         sub = st.selectbox("Subject", [r["subject"] for r in P["attendance"]])
