@@ -11,32 +11,41 @@ DEFAULT = {"name": "Friend", "branch": "CSE", "sem": 5, "req": 75, "interests": 
                           {"subject": "CN", "attended": 14, "total": 20}]}
 
 def load_profile():
-    if os.path.exists(PROFILE_FILE):
-        return json.load(open(PROFILE_FILE, encoding="utf-8"))
-    return DEFAULT
+    try:
+        if os.path.exists(PROFILE_FILE):
+            return json.load(open(PROFILE_FILE, encoding="utf-8"))
+    except Exception:
+        pass
+    return json.loads(json.dumps(DEFAULT))
 
 if "profile" not in st.session_state:
-    st.session_state.profile = load_profile()
-    st.session_state.items, st.session_state.brief = [], ""
-P = st.session_state.profile
+    st.session_state["profile"] = load_profile()
+    st.session_state["items"] = []
+    st.session_state["brief"] = ""
+P = st.session_state["profile"]
 
-# Retrieve Groq API Key from Streamlit Secrets or Environment Variable
-GROQ_API_KEY = st.secrets.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY")
+# Groq key: Streamlit Cloud -> Settings -> Secrets  (GROQ_API_KEY = "...")
+try:
+    GROQ_API_KEY = st.secrets.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY")
+except Exception:
+    GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_models(key):
+    return core.list_groq_models(key)
 
 # ---------------- Sidebar ----------------
 with st.sidebar:
     st.title("🎓 College Copilot")
-    st.caption("Powered by Groq Cloud API ⚡")
-    
+    st.caption("Powered by Groq Cloud API ⚡  ·  use sample data only on this public link")
+
     if not GROQ_API_KEY:
         st.error("⚠️ GROQ_API_KEY missing! Add it in Streamlit Cloud -> Settings -> Secrets.")
-    
-    # Available Groq models
-    groq_models = core.list_groq_models(GROQ_API_KEY) if GROQ_API_KEY else []
-    groq_models = groq_models or ["openai/gpt-oss-120b"]
+
+    groq_models = (get_models(GROQ_API_KEY) if GROQ_API_KEY else []) or ["openai/gpt-oss-120b"]
     model = st.selectbox("Model", groq_models, index=groq_models.index(core.pick_default(groq_models)))
     vision = st.selectbox("Vision model (screenshots, optional)", [""] + groq_models,
-                      help="Leave blank if no vision model is available. Paste the notice text instead.")
+                          help="Leave blank if no vision model is available. Paste the notice text instead.")
 
     st.subheader("Student profile")
     P["name"] = st.text_input("Name", P["name"])
@@ -55,7 +64,7 @@ with st.sidebar:
     fast = st.checkbox("Fast mode (only scan messages with keywords)", True)
     go = st.button("🔍 Analyze", type="primary", width="stretch")
 
-# attendance table lives in main area (Attendance tab) but subjects needed for extraction
+# attendance table lives in the Attendance tab, but subjects are needed for extraction
 att_df = pd.DataFrame(P["attendance"])
 P["subjects"] = list(att_df["subject"])
 
@@ -63,39 +72,51 @@ if go:
     if not GROQ_API_KEY:
         st.error("Please add your GROQ_API_KEY before running analysis.")
     else:
-        blocks = []
-        for f in chats:
-            msgs = core.relevant_messages(core.parse_chat(f.getvalue().decode("utf-8", "ignore")), days, fast)
-            blocks += core.chunk_messages(msgs)
-        for f in pdfs:
-            t = core.pdf_to_text(f)
-            blocks += [t[i:i + 3500] for i in range(0, len(t), 3500)]
-        for f in imgs:
-            blocks.append(core.image_to_text(f.getvalue(), vision, api_key=GROQ_API_KEY))
-        if pasted.strip():
-            blocks.append(pasted)
-        if not blocks:
-            st.warning("Upload at least one chat, PDF, screenshot or pasted text.")
-        else:
-            bar = st.progress(0, text="Groq AI is analyzing your files…")
-            raw = core.extract_items(blocks, P, model, progress=lambda x: bar.progress(x), api_key=GROQ_API_KEY)
-            bar.empty()
-            st.session_state["items"] = core.rank(raw, P)
-            alerts = core.attendance_actions(P["attendance"], P["req"])
-            st.session_state.brief = core.morning_brief(st.session_state.items, alerts, P, model, api_key=GROQ_API_KEY) if raw or alerts else ""
-            json.dump(P, open(PROFILE_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+        try:
+            blocks = []
+            for f in chats:
+                msgs = core.relevant_messages(core.parse_chat(f.getvalue().decode("utf-8", "ignore")), days, fast)
+                blocks += core.chunk_messages(msgs)
+            for f in pdfs:
+                t = core.pdf_to_text(f)
+                blocks += [t[i:i + 3500] for i in range(0, len(t), 3500)]
+            if imgs and not vision:
+                st.warning("Screenshots skipped: pick a vision model in the sidebar, or paste the notice text instead.")
+            for f in (imgs if vision else []):
+                blocks.append(core.image_to_text(f.getvalue(), vision, api_key=GROQ_API_KEY))
+            if pasted.strip():
+                blocks.append(pasted)
+            blocks = [b for b in blocks if b and b.strip()]
+            if not blocks:
+                st.warning("Upload at least one chat, PDF, screenshot or pasted text.")
+            else:
+                bar = st.progress(0, text="Groq AI is analyzing your files…")
+                raw = core.extract_items(blocks, P, model, progress=lambda x: bar.progress(x), api_key=GROQ_API_KEY)
+                bar.empty()
+                st.session_state["items"] = core.rank(raw, P)
+                alerts_now = core.attendance_actions(P["attendance"], P["req"])
+                st.session_state["brief"] = (core.morning_brief(st.session_state["items"], alerts_now, P, model,
+                                                                api_key=GROQ_API_KEY) if raw or alerts_now else "")
+                if not raw:
+                    st.info("The AI read your files but found nothing that needs action.")
+                try:
+                    json.dump(P, open(PROFILE_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=1, default=str)
+                except Exception:
+                    pass
+        except Exception as e:
+            st.error(f"Analysis failed: {e}")
 
 items = st.session_state["items"]
 alerts = core.attendance_actions(P["attendance"], P["req"])
 ICON = {"deadline": "⏰", "exam": "📝", "notice": "📢", "internship": "💼", "event": "🎤", "fee": "💳"}
 
 def when(i):
-    d = i["days"]
+    d = i.get("days")
     return "date unclear" if d is None else "TODAY" if d == 0 else "tomorrow" if d == 1 else f"in {d} days ({i['date']})"
 
 def card(i):
     link = f" · [open link]({i['link']})" if i.get("link") else ""
-    st.markdown(f"**{ICON[i['type']]} {i['title']}** — _{when(i)}_  \n➜ {i.get('action', '')}{link}")
+    st.markdown(f"**{ICON.get(i['type'], '📢')} {i['title']}** — _{when(i)}_  \n➜ {i.get('action', '')}{link}")
 
 tab_today, tab_att, tab_dl, tab_int, tab_ask, tab_exp = st.tabs(
     ["📌 Today", "📊 Attendance", "⏰ Deadlines & Exams", "💼 Internships", "💬 Ask", "📤 Export"])
@@ -110,13 +131,13 @@ with tab_today:
     if top:
         st.subheader("🔥 Do these first")
         for i in top: card(i)
-    rest = [i for i in items[3:] if i["days"] is not None and i["days"] <= 7]
+    rest = [i for i in items[3:] if i.get("days") is not None and i["days"] <= 7]
     if rest:
         st.subheader("This week")
         for i in rest: card(i)
-    if st.session_state.brief:
+    if st.session_state["brief"]:
         st.subheader("📱 Ready-to-send morning message")
-        st.code(st.session_state.brief, language=None)
+        st.code(st.session_state["brief"], language=None)
 
 with tab_att:
     st.header("Attendance planner")
@@ -158,8 +179,11 @@ with tab_ask:
         if not GROQ_API_KEY:
             st.error("Please add your GROQ_API_KEY to secrets to use chat.")
         else:
-            with st.spinner("Thinking on Groq Cloud…"):
-                st.write(core.ask(q, items, alerts, P, model, api_key=GROQ_API_KEY))
+            try:
+                with st.spinner("Thinking on Groq Cloud…"):
+                    st.write(core.ask(q, items, alerts, P, model, api_key=GROQ_API_KEY))
+            except Exception as e:
+                st.error(f"Could not get an answer: {e}")
 
 with tab_exp:
     st.header("Export")
