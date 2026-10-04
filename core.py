@@ -1,6 +1,6 @@
 """Core logic: parsing, local-LLM extraction (Ollama), ranking, attendance math, ICS export.
 Everything runs on the student's own laptop - no cloud calls."""
-import re, json, math, base64, hashlib, datetime as dt
+import re, json, math, time, base64, hashlib, datetime as dt
 import requests
 
 OLLAMA = "http://localhost:11434"
@@ -61,25 +61,79 @@ def pdf_to_text(file):
         file.seek(0)
         return "\n".join((p.extract_text() or "") for p in PdfReader(file).pages)
 
-def image_to_text(data, vision_model):
-    r = requests.post(f"{OLLAMA}/api/generate", json={
-        "model": vision_model, "stream": False,
-        "prompt": "Transcribe all text in this college notice/timetable image exactly. Keep dates and links.",
-        "images": [base64.b64encode(data).decode()]}, timeout=300)
-    return r.json().get("response", "")
+# ---------------- LLM layer: Groq cloud (if api_key) or local Ollama ----------------
+GROQ = "https://api.groq.com/openai/v1"
+_SKIP = ("whisper", "guard", "safeguard", "tts", "orpheus", "playai", "embed")
 
-# ---------------- Ollama helpers ----------------
-def list_models():
+def list_groq_models(api_key):
+    """Live list of chat models on this key's account (Groq retires models often)."""
+    try:
+        r = requests.get(f"{GROQ}/models", headers={"Authorization": f"Bearer {api_key}"}, timeout=10)
+        ids = sorted(m["id"] for m in r.json()["data"] if m.get("active", True))
+        return [i for i in ids if not any(x in i.lower() for x in _SKIP)]
+    except Exception:
+        return []
+
+def pick_default(models):
+    for pref in ("openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.6-27b"):
+        if pref in models:
+            return pref
+    return models[0] if models else "openai/gpt-oss-120b"
+
+def list_models():  # local Ollama models
     try:
         return [m["name"] for m in requests.get(f"{OLLAMA}/api/tags", timeout=3).json()["models"]]
     except Exception:
         return []
 
-def _generate(model, prompt, as_json=True):
+def _groq_chat(api_key, model, messages, as_json, retries=4):
+    body = {"model": model, "messages": messages, "temperature": 0}
+    if as_json:
+        body["response_format"] = {"type": "json_object"}
+    for attempt in range(retries):
+        r = requests.post(f"{GROQ}/chat/completions", json=body, timeout=120,
+                          headers={"Authorization": f"Bearer {api_key}"})
+        if r.status_code == 429:                      # free-tier rate limit: wait and retry
+            time.sleep(min(3 * 2 ** attempt, 20)); continue
+        if r.status_code == 400 and "response_format" in body:
+            body.pop("response_format"); continue     # model without JSON mode: ask in prompt
+        if r.status_code >= 400:
+            raise RuntimeError(f"Groq error {r.status_code} for model '{model}': {r.text[:300]}")
+        return r.json()["choices"][0]["message"]["content"] or ""
+    raise RuntimeError("Groq rate limit hit. Wait a minute and press Analyze again.")
+
+def _generate(model, prompt, as_json=True, api_key=None):
+    if api_key:
+        out = _groq_chat(api_key, model, [{"role": "user", "content": prompt}], as_json)
+        return re.sub(r"<think>.*?</think>", "", out, flags=re.S).strip()
     body = {"model": model, "prompt": prompt, "stream": False, "options": {"temperature": 0}}
     if as_json:
         body["format"] = "json"
     return requests.post(f"{OLLAMA}/api/generate", json=body, timeout=600).json()["response"]
+
+def _json_from(text):
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
+    m = re.search(r"\{.*\}", text, re.S)
+    return json.loads(m.group(0)) if m else {}
+
+def image_to_text(data, vision_model="", api_key=None, **kwargs):
+    """Read a notice screenshot with a vision model. Returns '' if no vision model works."""
+    if not vision_model:
+        return ""
+    prompt = "Transcribe all text in this college notice/timetable image exactly. Keep dates and links."
+    try:
+        if api_key:
+            mime = "image/jpeg" if data[:2] == b"\xff\xd8" else "image/png"
+            uri = f"data:{mime};base64,{base64.b64encode(data).decode()}"
+            msg = [{"role": "user", "content": [{"type": "text", "text": prompt},
+                                               {"type": "image_url", "image_url": {"url": uri}}]}]
+            return _groq_chat(api_key, vision_model, msg, as_json=False)
+        r = requests.post(f"{OLLAMA}/api/generate", json={
+            "model": vision_model, "stream": False, "prompt": prompt,
+            "images": [base64.b64encode(data).decode()]}, timeout=300)
+        return r.json().get("response", "")
+    except Exception:
+        return ""
 
 EXTRACT = """You help a college student. Today is {today} ({weekday}).
 Student: {branch}, semester {sem}. Subjects: {subjects}. Interests: {interests}.
@@ -102,9 +156,10 @@ def _norm_date(s):
     except Exception:
         return None
 
-def extract_items(blocks, profile, model, progress=None):
+def extract_items(blocks, profile, model, progress=None, api_key=None, **kwargs):
     """blocks: list of text strings (chat chunks, PDF text, OCR text)."""
-    items, seen = [], set()
+    items, seen, errors = [], set(), []
+    blocks = [b for b in blocks if b and b.strip()]
     for i, chunk in enumerate(blocks):
         if progress:
             progress((i + 1) / len(blocks))
@@ -113,9 +168,9 @@ def extract_items(blocks, profile, model, progress=None):
             branch=profile.get("branch", "unknown"), sem=profile.get("sem", "?"),
             subjects=", ".join(profile["subjects"]), interests=", ".join(profile.get("interests", [])), chunk=chunk)
         try:
-            raw = json.loads(_generate(model, prompt))
-        except Exception:
-            continue
+            raw = _json_from(_generate(model, prompt, api_key=api_key))
+        except Exception as e:
+            errors.append(str(e)); continue
         for it in raw.get("items", []) if isinstance(raw, dict) else []:
             if not isinstance(it, dict) or not it.get("title") or it.get("relevant") is False:
                 continue
@@ -128,6 +183,8 @@ def extract_items(blocks, profile, model, progress=None):
             if key not in seen:
                 seen.add(key)
                 items.append(it)
+    if errors and not items:
+        raise RuntimeError(errors[0])
     return items
 
 def chunk_messages(msgs, size=40):
@@ -175,18 +232,18 @@ def attendance_actions(att_rows, req):
     return [t for _, t in sorted(out)]
 
 # ---------------- LLM extras ----------------
-def morning_brief(items, alerts, profile, model):
+def morning_brief(items, alerts, profile, model, api_key=None, **kwargs):
     top = [{k: i.get(k) for k in ("type", "title", "date", "action")} for i in items[:6]]
     p = (f"Write a short friendly Hinglish morning message (max 6 lines, with emojis) for {profile['name']}, "
          f"telling what to do today. Use ONLY this data.\nAttendance alerts: {alerts}\nItems: {json.dumps(top)}")
-    return _generate(model, p, as_json=False)
+    return _generate(model, p, as_json=False, api_key=api_key)
 
-def ask(question, items, alerts, profile, model):
+def ask(question, items, alerts, profile, model, api_key=None, **kwargs):
     ctx = json.dumps([{k: i.get(k) for k in ("type", "title", "date", "subject", "action", "link")} for i in items])
     p = (f"You are a private college assistant for {profile['name']}. Today is {dt.date.today()}. "
          f"Answer in the language of the question (Hinglish ok), briefly, using ONLY this data. "
          f"If the data does not contain the answer say so.\nAttendance alerts: {alerts}\nItems: {ctx}\n\nQuestion: {question}")
-    return _generate(model, p, as_json=False)
+    return _generate(model, p, as_json=False, api_key=api_key)
 
 # ---------------- Calendar export ----------------
 def to_ics(items):
