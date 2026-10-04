@@ -32,9 +32,11 @@ with st.sidebar:
         st.error("⚠️ GROQ_API_KEY missing! Add it in Streamlit Cloud -> Settings -> Secrets.")
     
     # Available Groq models
-    groq_models = ["qwen-2.5-32b", "llama-3.1-8b-instant", "llama-3.3-70b-versatile"]
-    model = st.selectbox("Model", groq_models, index=0)
-    vision = st.text_input("Vision model (for screenshots)", "llama-3.2-11b-vision-preview")
+    groq_models = core.list_groq_models(GROQ_API_KEY) if GROQ_API_KEY else []
+    groq_models = groq_models or ["openai/gpt-oss-120b"]
+    model = st.selectbox("Model", groq_models, index=groq_models.index(core.pick_default(groq_models)))
+    vision = st.selectbox("Vision model (screenshots, optional)", [""] + groq_models,
+                      help="Leave blank if no vision model is available. Paste the notice text instead.")
 
     st.subheader("Student profile")
     P["name"] = st.text_input("Name", P["name"])
